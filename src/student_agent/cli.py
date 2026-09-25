@@ -8,11 +8,14 @@ from pathlib import Path
 
 from .cases import load_case_set
 from .config import Settings
-from .contracts import Contracts
+from .contracts import ContractError, Contracts
 from .mcp_gateway import connect_gateway
 from .submission import package_submission, validate_artifacts
 from .trace import TraceWriter
 from .workflow import solve_case
+
+CASE_ATTEMPTS = 4
+CASE_TIMEOUT_S = 120
 
 
 def _root(value: str) -> Path:
@@ -42,22 +45,44 @@ async def _run(root: Path) -> None:
 
     async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
         discovered_tools = await gateway.list_tools()
-        if not discovered_tools:
-            raise RuntimeError("MCP Gateway returned no tools")
-        for case_id in case_set.case_ids:
-            case = case_set.cases[case_id]
-            trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
-            output = await solve_case(case, gateway, trace)
-            contracts.validate_output(output, f"outputs/{case_id}.json")
-            if output.get("case_id") != case_id:
-                raise ValueError(f"solver returned a mismatched case_id for {case_id}")
-            target = output_root / f"{case_id}.json"
-            temporary = target.with_suffix(".json.tmp")
-            temporary.write_text(
-                json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-            )
-            temporary.replace(target)
-            trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+    if not discovered_tools:
+        raise RuntimeError("MCP Gateway returned no tools")
+
+    async def solve_once(case: dict) -> dict:
+        async with connect_gateway(
+            settings.mcp_endpoint, settings.team_api_key, contracts
+        ) as gateway:
+            return await asyncio.wait_for(solve_case(case, gateway, trace), CASE_TIMEOUT_S)
+
+    for case_id in case_set.case_ids:
+        case = case_set.cases[case_id]
+        trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
+        # One MCP session per case: a dropped connection only costs a retry of that case.
+        for attempt in range(1, CASE_ATTEMPTS + 1):
+            try:
+                output = await solve_once(case)
+                break
+            except (ContractError, ValueError, PermissionError):
+                raise
+            except Exception as exc:  # transport failures surface as ExceptionGroups
+                if attempt == CASE_ATTEMPTS:
+                    raise RuntimeError(f"{case_id}: MCP unavailable after retries") from exc
+                print(
+                    f"{case_id}: attempt {attempt} failed ({type(exc).__name__}), retrying",
+                    file=sys.stderr,
+                )
+                await asyncio.sleep(2 * attempt)
+        contracts.validate_output(output, f"outputs/{case_id}.json")
+        if output.get("case_id") != case_id:
+            raise ValueError(f"solver returned a mismatched case_id for {case_id}")
+        target = output_root / f"{case_id}.json"
+        temporary = target.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        temporary.replace(target)
+        trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+        print(f"{case_id}: {output['assessment']['primary_issue']}", file=sys.stderr)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -80,8 +105,7 @@ def main() -> None:
         if args.command == "validate-inputs":
             case_set = load_case_set(root)
             print(
-                f"OK: {case_set.variant_id} / {case_set.version} / "
-                f"{len(case_set.case_ids)} cases"
+                f"OK: {case_set.variant_id} / {case_set.version} / {len(case_set.case_ids)} cases"
             )
         elif args.command == "mcp-tools":
             asyncio.run(_show_tools(root))
